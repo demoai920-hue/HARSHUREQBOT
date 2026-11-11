@@ -208,38 +208,61 @@ async def get_first_name(user_id: int, target) -> str:
 async def send_sequence(user_id: int, target):
     log.info("MESSAGE SEQUENCE START for user_id=%s", user_id)
 
-    # 1) STRING_SESSION sends only this intro message.
+    bot_messages_sent = False
+
+    # 1) Bot sends the welcome text first.
+    try:
+        first_name = await get_first_name(user_id, target)
+        welcome_payload = {
+            "chat_id": user_id,
+            "text": WELCOME_TEXT.replace("{name}", first_name),
+            "parse_mode": "HTML",
+            "link_preview_options": {"is_disabled": True},
+        }
+        await send_from_bot("sendMessage", welcome_payload, "welcome text")
+
+        # 2) Bot copies the setup video post, including its original caption.
+        video_chat, video_message_id = parse_telegram_post_url(VIDEO_POST_URL)
+        video_payload = {
+            "chat_id": user_id,
+            "from_chat_id": video_chat,
+            "message_id": video_message_id,
+        }
+        await send_from_bot("copyMessage", video_payload, "setup video")
+
+        # 3) Bot copies the APK post and adds its inline buttons.
+        apk_chat, apk_message_id = parse_telegram_post_url(APK_POST_URL)
+        apk_payload = {
+            "chat_id": user_id,
+            "from_chat_id": apk_chat,
+            "message_id": apk_message_id,
+            "reply_markup": APK_BUTTONS,
+        }
+        await send_from_bot("copyMessage", apk_payload, "APK message")
+
+        bot_messages_sent = True
+        log.info("BOT MESSAGE SEQUENCE COMPLETE for user_id=%s", user_id)
+
+    except Exception:
+        # A bot cannot initiate a private chat until the user has opened it and
+        # pressed /start. Keep the requested order, but do not block the userbot
+        # intro when the Bot API rejects its private message.
+        log.exception(
+            "BOT MESSAGE SEQUENCE FAILED for user_id=%s; continuing to userbot intro",
+            user_id,
+        )
+
+    # 4) User session sends the intro only after the bot stage was attempted.
     await send_intro_from_user_session(target)
 
-    # 2) Bot: welcome text with the user's name.
-    first_name = await get_first_name(user_id, target)
-    welcome_payload = {
-        "chat_id": user_id,
-        "text": WELCOME_TEXT.replace("{name}", first_name),
-        "parse_mode": "HTML",
-        "link_preview_options": {"is_disabled": True},
-    }
-    await send_from_bot("sendMessage", welcome_payload, "welcome text")
-
-    # 3) Bot: copy the video post (original caption is copied too).
-    video_chat, video_message_id = parse_telegram_post_url(VIDEO_POST_URL)
-    video_payload = {
-        "chat_id": user_id,
-        "from_chat_id": video_chat,
-        "message_id": video_message_id,
-    }
-    await send_from_bot("copyMessage", video_payload, "setup video")
-
-    # 4) Bot: copy the APK post (original caption is copied too) and add the 3 inline buttons.
-    apk_chat, apk_message_id = parse_telegram_post_url(APK_POST_URL)
-    apk_payload = {
-        "chat_id": user_id,
-        "from_chat_id": apk_chat,
-        "message_id": apk_message_id,
-        "reply_markup": APK_BUTTONS,
-    }
-    await send_from_bot("copyMessage", apk_payload, "APK message")
-    log.info("MESSAGE SEQUENCE COMPLETE for user_id=%s", user_id)
+    if bot_messages_sent:
+        log.info("FULL MESSAGE SEQUENCE COMPLETE for user_id=%s", user_id)
+    else:
+        log.warning(
+            "USERBOT INTRO SENT, BUT BOT MESSAGES WERE NOT DELIVERED for user_id=%s. "
+            "The requester may need to open the bot and press /start.",
+            user_id,
+        )
 
 
 @bot.on(events.Raw(types.UpdateBotChatInviteRequester))
