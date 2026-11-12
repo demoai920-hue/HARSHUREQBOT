@@ -239,20 +239,20 @@ def _bot_api_upload_file(method: str, payload: dict, field_name: str,
             value = json.dumps(value, ensure_ascii=False)
         else:
             value = str(value)
-        chunks.append(
-            f"--{boundary}\\r\\n"
-            f'Content-Disposition: form-data; name="{key}"\\r\\n'
-            f"\\r\\n{value}\\r\\n"
-        .encode("utf-8")
-        )
+        part = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{key}"\r\n'
+            f"\r\n{value}\r\n"
+        ).encode("utf-8")
+        chunks.append(part)
 
-    safe_filename = os.path.basename(filename).replace('"', "_").replace("\\r", "").replace("\\n", "")
+    safe_filename = os.path.basename(filename).replace('"', "_").replace("\r", "").replace("\n", "")
     file_header = (
-        f"--{boundary}\\r\\n"
-        f'Content-Disposition: form-data; name="{field_name}"; filename="{safe_filename}"\\r\\n'
-        f"Content-Type: {content_type}\\r\\n\\r\\n"
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="{field_name}"; filename="{safe_filename}"\r\n'
+        f"Content-Type: {content_type}\r\n\r\n"
     ).encode("utf-8")
-    closing = f"\\r\\n--{boundary}--\\r\\n".encode("utf-8")
+    closing = f"\r\n--{boundary}--\r\n".encode("utf-8")
     prefix = b"".join(chunks) + file_header
     content_length = len(prefix) + os.path.getsize(file_path) + len(closing)
 
