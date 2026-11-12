@@ -1,8 +1,11 @@
 import asyncio
 import html
+import http.client
 import json
 import logging
+import mimetypes
 import os
+import tempfile
 import urllib.error
 import urllib.request
 
@@ -182,6 +185,172 @@ async def send_from_bot(method: str, payload: dict, label: str):
         raise
 
 
+def _telegram_entities_to_bot_api(entities):
+    """Convert supported Telethon caption entities to Bot API caption_entities."""
+    entity_types = {
+        "MessageEntityBold": "bold",
+        "MessageEntityItalic": "italic",
+        "MessageEntityUnderline": "underline",
+        "MessageEntityStrike": "strikethrough",
+        "MessageEntityCode": "code",
+        "MessageEntityPre": "pre",
+        "MessageEntityTextUrl": "text_link",
+        "MessageEntityUrl": "url",
+        "MessageEntityEmail": "email",
+        "MessageEntityPhone": "phone_number",
+        "MessageEntityMention": "mention",
+        "MessageEntityHashtag": "hashtag",
+        "MessageEntityCashtag": "cashtag",
+        "MessageEntityBotCommand": "bot_command",
+        "MessageEntityCustomEmoji": "custom_emoji",
+        "MessageEntitySpoiler": "spoiler",
+        "MessageEntityBlockquote": "blockquote",
+    }
+    converted = []
+    for entity in entities or []:
+        entity_type = entity_types.get(type(entity).__name__)
+        if not entity_type:
+            continue
+        item = {
+            "type": entity_type,
+            "offset": entity.offset,
+            "length": entity.length,
+        }
+        if entity_type == "text_link":
+            item["url"] = entity.url
+        elif entity_type == "custom_emoji":
+            item["custom_emoji_id"] = str(entity.document_id)
+        elif entity_type == "pre" and getattr(entity, "language", None):
+            item["language"] = entity.language
+        converted.append(item)
+    return converted
+
+
+def _bot_api_upload_file(method: str, payload: dict, field_name: str,
+                         file_path: str, filename: str, content_type: str):
+    """Stream a local media file to Telegram Bot API using multipart/form-data."""
+    boundary = "----HarshuReqBot" + os.urandom(12).hex()
+    chunks = []
+
+    for key, value in payload.items():
+        if value is None:
+            continue
+        if isinstance(value, (dict, list)):
+            value = json.dumps(value, ensure_ascii=False)
+        else:
+            value = str(value)
+        chunks.append(
+            f"--{boundary}\\r\\n"
+            f'Content-Disposition: form-data; name="{key}"\\r\\n'
+            f"\\r\\n{value}\\r\\n"
+        .encode("utf-8")
+        )
+
+    safe_filename = os.path.basename(filename).replace('"', "_").replace("\\r", "").replace("\\n", "")
+    file_header = (
+        f"--{boundary}\\r\\n"
+        f'Content-Disposition: form-data; name="{field_name}"; filename="{safe_filename}"\\r\\n'
+        f"Content-Type: {content_type}\\r\\n\\r\\n"
+    ).encode("utf-8")
+    closing = f"\\r\\n--{boundary}--\\r\\n".encode("utf-8")
+    prefix = b"".join(chunks) + file_header
+    content_length = len(prefix) + os.path.getsize(file_path) + len(closing)
+
+    connection = http.client.HTTPSConnection("api.telegram.org", timeout=180)
+    try:
+        connection.putrequest("POST", f"/bot{BOT_TOKEN}/{method}")
+        connection.putheader("Content-Type", f"multipart/form-data; boundary={boundary}")
+        connection.putheader("Content-Length", str(content_length))
+        connection.putheader("Connection", "close")
+        connection.endheaders()
+
+        connection.send(prefix)
+        with open(file_path, "rb") as media_file:
+            while True:
+                data = media_file.read(1024 * 1024)
+                if not data:
+                    break
+                connection.send(data)
+        connection.send(closing)
+
+        response = connection.getresponse()
+        raw_result = response.read().decode("utf-8", errors="replace")
+        try:
+            result = json.loads(raw_result)
+        except json.JSONDecodeError as exc:
+            raise BotAPIError(
+                f"Telegram returned HTTP {response.status}: {raw_result[:500]}"
+            ) from exc
+
+        if not result.get("ok"):
+            raise BotAPIError(result.get("description", f"HTTP {response.status}"))
+        return result.get("result")
+    finally:
+        connection.close()
+
+
+async def send_source_media_from_bot(method: str, payload: dict, source_post_url: str,
+                                     field_name: str, label: str):
+    """Download a channel post with the user session, then upload it via Bot API sendVideo/sendDocument."""
+    source_chat_name, source_message_id = parse_telegram_post_url(source_post_url)
+    temp_path = None
+    log.info("BOT API START: %s using %s", label, method)
+
+    try:
+        source_chat = await user.get_entity(source_chat_name)
+        source_message = await user.get_messages(source_chat, ids=source_message_id)
+        if source_message is None or not source_message.media:
+            raise RuntimeError(f"Source post has no downloadable media: {source_post_url}")
+
+        original_name = getattr(getattr(source_message, "file", None), "name", None)
+        if not original_name:
+            original_name = "video.mp4" if method == "sendVideo" else "attachment.apk"
+
+        suffix = os.path.splitext(original_name)[1]
+        if not suffix:
+            suffix = ".mp4" if method == "sendVideo" else ".apk"
+
+        with tempfile.NamedTemporaryFile(prefix="harshureqbot_", suffix=suffix, delete=False) as temp_file:
+            temp_path = temp_file.name
+
+        downloaded_path = await user.download_media(source_message, file=temp_path)
+        if not downloaded_path or not os.path.isfile(downloaded_path):
+            raise RuntimeError(f"Could not download source media: {source_post_url}")
+
+        upload_payload = dict(payload)
+        original_caption = source_message.message or ""
+        if original_caption:
+            upload_payload["caption"] = original_caption
+            caption_entities = _telegram_entities_to_bot_api(source_message.entities)
+            if caption_entities:
+                upload_payload["caption_entities"] = caption_entities
+
+        content_type = mimetypes.guess_type(original_name)[0]
+        if not content_type:
+            content_type = "video/mp4" if method == "sendVideo" else "application/vnd.android.package-archive"
+
+        result = await asyncio.to_thread(
+            _bot_api_upload_file,
+            method,
+            upload_payload,
+            field_name,
+            downloaded_path,
+            original_name,
+            content_type,
+        )
+        log.info("BOT API SUCCESS: %s sent via bot", label)
+        return result
+    except Exception:
+        log.exception("BOT API FAILED: %s using %s", label, method)
+        raise
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                log.warning("Could not remove temporary media file: %s", temp_path)
+
+
 def parse_telegram_post_url(post_url: str):
     """Parse a public Telegram post URL into source chat and message ID."""
     from urllib.parse import urlparse
@@ -221,24 +390,20 @@ async def send_sequence(user_id: int, target):
         }
         await send_from_bot("sendMessage", welcome_payload, "welcome text")
 
-        # 2) Bot copies the setup video post, including its original caption.
-        video_chat, video_message_id = parse_telegram_post_url(VIDEO_POST_URL)
-        video_payload = {
-            "chat_id": user_id,
-            "from_chat_id": video_chat,
-            "message_id": video_message_id,
-        }
-        await send_from_bot("copyMessage", video_payload, "setup video")
+        # 2) Bot sends the video as a new upload, keeping its original caption.
+        video_payload = {"chat_id": user_id}
+        await send_source_media_from_bot(
+            "sendVideo", video_payload, VIDEO_POST_URL, "video", "setup video"
+        )
 
-        # 3) Bot copies the APK post and adds its inline buttons.
-        apk_chat, apk_message_id = parse_telegram_post_url(APK_POST_URL)
+        # 3) Bot sends the APK as a new document upload, keeping its original caption and buttons.
         apk_payload = {
             "chat_id": user_id,
-            "from_chat_id": apk_chat,
-            "message_id": apk_message_id,
             "reply_markup": APK_BUTTONS,
         }
-        await send_from_bot("copyMessage", apk_payload, "APK message")
+        await send_source_media_from_bot(
+            "sendDocument", apk_payload, APK_POST_URL, "document", "APK message"
+        )
 
         bot_messages_sent = True
         log.info("BOT MESSAGE SEQUENCE COMPLETE for user_id=%s", user_id)
