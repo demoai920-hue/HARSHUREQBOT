@@ -132,29 +132,76 @@ async def bot_api_request(method: str, payload: dict):
     return await asyncio.to_thread(_bot_api_request, method, payload)
 
 
+async def user_request(label: str, operation, attempts: int = 3):
+    """Run a user-session request with reconnect and retry on transport disconnects."""
+    last_error = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            if not user.is_connected():
+                log.warning(
+                    "User session is disconnected before %s; reconnecting (attempt %s/%s)",
+                    label, attempt, attempts,
+                )
+                await user.connect()
+                if not user.is_connected():
+                    raise ConnectionError("Telethon user client did not reconnect")
+
+            return await operation()
+
+        except (ConnectionError, OSError, asyncio.TimeoutError) as exc:
+            last_error = exc
+            log.warning(
+                "User-session connection failed during %s (attempt %s/%s): %s",
+                label, attempt, attempts, exc,
+            )
+
+            # Reset a stale sender so the next attempt opens a fresh connection.
+            try:
+                await user.disconnect()
+            except Exception as disconnect_exc:
+                log.debug("Error while resetting user session: %s", disconnect_exc)
+
+            if attempt < attempts:
+                await asyncio.sleep(min(2 * attempt, 5))
+
+    raise ConnectionError(
+        f"User session stayed disconnected during {label} after {attempts} attempts"
+    ) from last_error
+
+
 async def resolve_user(user_id: int, peer):
-    """Resolve the requester using the STRING_SESSION account's own access hash."""
+    """Resolve the requester through the user session, reconnecting on transport errors."""
     try:
-        return await user.get_input_entity(user_id)
+        return await user_request(
+            f"resolve requester {user_id}",
+            lambda: user.get_input_entity(user_id),
+        )
     except ValueError:
         pass
 
     try:
-        chat = await user.get_input_entity(peer)
-        result = await user(
-            functions.messages.GetChatInviteImportersRequest(
-                peer=chat,
-                offset_date=0,
-                offset_user=types.InputUserEmpty(),
-                limit=100,
-                requested=True,
-            )
+        chat = await user_request(
+            f"resolve join-request chat for {user_id}",
+            lambda: user.get_input_entity(peer),
+        )
+        result = await user_request(
+            f"fetch pending requester {user_id}",
+            lambda: user(
+                functions.messages.GetChatInviteImportersRequest(
+                    peer=chat,
+                    offset_date=0,
+                    offset_user=types.InputUserEmpty(),
+                    limit=100,
+                    requested=True,
+                )
+            ),
         )
         for requester in result.users:
             if requester.id == user_id:
                 return utils.get_input_user(requester)
     except Exception as exc:
-        log.warning("Could not fetch pending requesters: %s", exc)
+        log.warning("Could not fetch pending requester %s: %s", user_id, exc)
 
     return None
 
@@ -163,7 +210,12 @@ async def send_intro_from_user_session(target):
     """The STRING_SESSION account sends exactly one message: the intro."""
     log.info("STEP 1/4 START: sending intro via user session")
     try:
-        await user.send_message(target, INTRO_MESSAGE, parse_mode="html", link_preview=False)
+        await user_request(
+            "send intro message",
+            lambda: user.send_message(
+                target, INTRO_MESSAGE, parse_mode="html", link_preview=False
+            ),
+        )
         log.info("STEP 1/4 SUCCESS: intro sent via user session")
     except Exception:
         log.exception("STEP 1/4 FAILED: intro could not be sent via user session")
@@ -236,8 +288,14 @@ def parse_telegram_post_url(post_url: str):
 async def get_source_caption(post_url: str):
     """Read the source post caption and formatting with the user session."""
     source_chat_name, source_message_id = parse_telegram_post_url(post_url)
-    source_chat = await user.get_entity(source_chat_name)
-    source_message = await user.get_messages(source_chat, ids=source_message_id)
+    source_chat = await user_request(
+        "resolve source media channel",
+        lambda: user.get_entity(source_chat_name),
+    )
+    source_message = await user_request(
+        "read source media post",
+        lambda: user.get_messages(source_chat, ids=source_message_id),
+    )
     if source_message is None:
         raise RuntimeError(f"Could not find source post: {post_url}")
 
@@ -253,7 +311,10 @@ async def get_first_name(user_id: int, target) -> str:
     """Requester's first name (HTML-escaped). Falls back to a generic word."""
     for ref in (target, user_id):
         try:
-            entity = await user.get_entity(ref)
+            entity = await user_request(
+                "fetch requester name",
+                lambda: user.get_entity(ref),
+            )
             name = (getattr(entity, "first_name", None) or "").strip()
             if name:
                 return html.escape(name)
