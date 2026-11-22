@@ -3,26 +3,35 @@ import html
 import json
 import logging
 import os
-import sqlite3
 import urllib.error
 import urllib.request
-from contextlib import closing
-from datetime import datetime, timezone
-from urllib.parse import urlparse
 
 from dotenv import load_dotenv
-from telethon import TelegramClient, events, types
+from telethon import TelegramClient, events, functions, types, utils
+from telethon.errors import (
+    FloodWaitError,
+    PeerFloodError,
+    UserIsBlockedError,
+    UserPrivacyRestrictedError,
+)
+from telethon.sessions import StringSession
 
 load_dotenv()
 
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
+STRING_SESSION = os.environ["STRING_SESSION"]
 
 VIDEO_POST_URL = "https://t.me/HARSHUREQASSETS/4"
 APK_POST_URL = "https://t.me/HARSHUREQASSETS/3"
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "requests.sqlite3")
 
+# Sent first by the account logged in through STRING_SESSION.
+INTRO_MESSAGE = (
+    'KITNE RUPEES KA LOSS HUA TUMHARA RECOVER KRNA CHAHTE HO?'
+)
+
+# Bot message 1: welcome text. {name} is replaced with the requester's first name.
 WELCOME_TEXT = (
     '<tg-emoji emoji-id="5363992034728229166">✨</tg-emoji> 𝗛𝗘𝗟𝗟𝗢 {name} '
     '<tg-emoji emoji-id="6312103973671147302">👑</tg-emoji>'
@@ -34,9 +43,11 @@ WELCOME_TEXT = (
     '<tg-emoji emoji-id="6147439566107186310">👇</tg-emoji>'
 )
 
-# Sent by the bot only after the user voluntarily starts the bot.
-INTRO_MESSAGE = "KITNE RUPEES KA LOSS HUA TUMHARA RECOVER KRNA CHAHTE HO?"
+# Video and APK are copied as-is from the channel posts, so their original
+# captions (with custom emojis) come along automatically. No caption is set here.
 
+# Inline buttons under the APK message.
+# style: "danger" = red, "success" = green, "primary" = blue.
 APK_BUTTONS = {
     "inline_keyboard": [
         [{
@@ -60,183 +71,34 @@ APK_BUTTONS = {
     ]
 }
 
+# All bot messages go through the Bot API only.
+# There is deliberately no STRING_SESSION fallback for bot messages.
+# No join request is approved or declined here.
+
 logging.basicConfig(
     format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
     level=logging.INFO,
     force=True,
 )
+# Show application logs and Telethon's INFO/WARNING/ERROR logs in the same terminal/journal.
 logging.getLogger("telethon").setLevel(logging.INFO)
 log = logging.getLogger("joinbot")
 
-# A persistent Telethon SQLite session keeps update state across restarts.
-# The separate requests.sqlite3 file stores durable join-request/delivery state.
-bot = TelegramClient("harshureqbot_bot", API_ID, API_HASH, auto_reconnect=True)
+# Bot listens for join-request updates. The user account is the reliable sender
+# when a requester has not started the bot in a private chat.
+bot = TelegramClient(StringSession(), API_ID, API_HASH)
+user = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 
-# Limit concurrent opt-in deliveries. This avoids flooding the Bot API during bursts.
-delivery_semaphore = asyncio.Semaphore(2)
+already_messaged: set[int] = set()
 in_progress: set[int] = set()
 
 
 class BotAPIError(RuntimeError):
-    def __init__(self, message: str, error_code: int | None = None,
-                 retry_after: int | None = None, retryable: bool = False):
-        super().__init__(message)
-        self.error_code = error_code
-        self.retry_after = retry_after
-        self.retryable = retryable
-
-
-def now_utc() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def db_connect():
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_db() -> None:
-    with closing(db_connect()) as conn:
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=FULL")
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS request_queue (
-                user_id INTEGER PRIMARY KEY,
-                peer TEXT,
-                source TEXT NOT NULL DEFAULT 'join_request',
-                status TEXT NOT NULL DEFAULT 'awaiting_start',
-                stage INTEGER NOT NULL DEFAULT 0,
-                request_count INTEGER NOT NULL DEFAULT 1,
-                first_seen_at TEXT NOT NULL,
-                last_seen_at TEXT NOT NULL,
-                started_at TEXT,
-                updated_at TEXT NOT NULL,
-                last_error TEXT
-            )
-            """
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_request_queue_status "
-            "ON request_queue(status, updated_at)"
-        )
-        conn.commit()
-
-
-def save_join_request(user_id: int, peer: str) -> None:
-    now = now_utc()
-    with closing(db_connect()) as conn:
-        conn.execute(
-            """
-            INSERT INTO request_queue
-                (user_id, peer, source, status, stage, request_count,
-                 first_seen_at, last_seen_at, updated_at)
-            VALUES (?, ?, 'join_request', 'awaiting_start', 0, 1, ?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                peer = excluded.peer,
-                request_count = request_queue.request_count + 1,
-                last_seen_at = excluded.last_seen_at,
-                updated_at = excluded.updated_at
-            """,
-            (user_id, peer, now, now, now),
-        )
-        conn.commit()
-
-
-def ensure_opt_in_record(user_id: int) -> None:
-    now = now_utc()
-    with closing(db_connect()) as conn:
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO request_queue
-                (user_id, source, status, stage, request_count,
-                 first_seen_at, last_seen_at, started_at, updated_at)
-            VALUES (?, 'direct_start', 'delivery_pending', 0, 0, ?, ?, ?, ?)
-            """,
-            (user_id, now, now, now, now),
-        )
-        conn.execute(
-            """
-            UPDATE request_queue
-            SET started_at = COALESCE(started_at, ?), updated_at = ?
-            WHERE user_id = ?
-            """,
-            (now, now, user_id),
-        )
-        conn.commit()
-
-
-def get_request(user_id: int):
-    with closing(db_connect()) as conn:
-        row = conn.execute(
-            "SELECT * FROM request_queue WHERE user_id = ?",
-            (user_id,),
-        ).fetchone()
-        return dict(row) if row else None
-
-
-def save_stage(user_id: int, stage: int) -> None:
-    status = "delivered" if stage >= 4 else "delivery_pending"
-    with closing(db_connect()) as conn:
-        conn.execute(
-            """
-            UPDATE request_queue
-            SET stage = ?, status = ?, last_error = NULL, updated_at = ?
-            WHERE user_id = ?
-            """,
-            (stage, status, now_utc(), user_id),
-        )
-        conn.commit()
-
-
-def save_error(user_id: int, error: str) -> None:
-    with closing(db_connect()) as conn:
-        conn.execute(
-            """
-            UPDATE request_queue
-            SET status = 'retry', last_error = ?, updated_at = ?
-            WHERE user_id = ?
-            """,
-            (error[:1000], now_utc(), user_id),
-        )
-        conn.commit()
-
-
-def parse_telegram_post_url(post_url: str):
-    parsed = urlparse(post_url)
-    parts = parsed.path.strip("/").split("/")
-    if (
-        parsed.netloc not in {"t.me", "www.t.me"}
-        or len(parts) != 2
-        or not parts[1].isdigit()
-    ):
-        raise ValueError(f"Unsupported Telegram post URL: {post_url}")
-    return f"@{parts[0]}", int(parts[1])
-
-
-def _parse_bot_response(raw_body: str, http_status: int | None = None):
-    try:
-        result = json.loads(raw_body)
-    except json.JSONDecodeError as exc:
-        raise BotAPIError(
-            f"Telegram returned invalid JSON (HTTP {http_status}): {raw_body[:300]}",
-            error_code=http_status,
-            retryable=bool(http_status and http_status >= 500),
-        ) from exc
-
-    if result.get("ok"):
-        return result.get("result")
-
-    error_code = result.get("error_code", http_status)
-    parameters = result.get("parameters") or {}
-    retry_after = parameters.get("retry_after")
-    description = result.get("description", "Unknown Bot API error")
-    retryable = error_code == 429 or bool(error_code and error_code >= 500)
-    raise BotAPIError(description, error_code, retry_after, retryable)
+    """Raised when Telegram's HTTP Bot API returns ok=false."""
 
 
 def _bot_api_request(method: str, payload: dict):
+    """Synchronous Bot API request, called through asyncio.to_thread()."""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(
@@ -247,232 +109,340 @@ def _bot_api_request(method: str, payload: dict):
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=45) as response:
-            body = response.read().decode("utf-8")
-            return _parse_bot_response(body, response.status)
+        with urllib.request.urlopen(request, timeout=35) as response:
+            result = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
-        return _parse_bot_response(body, exc.code)
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise BotAPIError(str(exc), retryable=True) from exc
-
-
-async def bot_api_request(method: str, payload: dict, attempts: int = 5):
-    delays = (1, 2, 4, 8, 12)
-    for attempt in range(attempts):
         try:
-            return await asyncio.to_thread(_bot_api_request, method, payload)
-        except BotAPIError as exc:
-            if not exc.retryable or attempt == attempts - 1:
-                raise
+            result = json.loads(body)
+        except json.JSONDecodeError:
+            raise BotAPIError(f"HTTP {exc.code}: {body}") from exc
+        if not result.get("ok"):
+            raise BotAPIError(result.get("description", f"HTTP {exc.code}")) from exc
+        return result.get("result")
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise BotAPIError(str(exc)) from exc
 
-            if exc.error_code == 429:
-                delay = exc.retry_after
-                # Avoid holding a delivery worker for a very long flood wait.
-                if delay is None or delay > 60:
-                    raise
-            else:
-                delay = delays[attempt]
+    if not result.get("ok"):
+        raise BotAPIError(result.get("description", "Unknown Bot API error"))
+    return result.get("result")
 
-            delay = max(1, int(delay))
+
+async def bot_api_request(method: str, payload: dict):
+    return await asyncio.to_thread(_bot_api_request, method, payload)
+
+
+async def user_request(label: str, operation, attempts: int = 3):
+    """Run a user-session request with reconnect and retry on transport disconnects."""
+    last_error = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            if not user.is_connected():
+                log.warning(
+                    "User session is disconnected before %s; reconnecting (attempt %s/%s)",
+                    label, attempt, attempts,
+                )
+                await user.connect()
+                if not user.is_connected():
+                    raise ConnectionError("Telethon user client did not reconnect")
+
+            return await operation()
+
+        except (ConnectionError, OSError, asyncio.TimeoutError) as exc:
+            last_error = exc
             log.warning(
-                "Temporary Bot API failure for %s (attempt %s/%s): %s; retrying in %ss",
-                method, attempt + 1, attempts, exc, delay,
+                "User-session connection failed during %s (attempt %s/%s): %s",
+                label, attempt, attempts, exc,
             )
-            await asyncio.sleep(delay)
+
+            # Reset a stale sender so the next attempt opens a fresh connection.
+            try:
+                await user.disconnect()
+            except Exception as disconnect_exc:
+                log.debug("Error while resetting user session: %s", disconnect_exc)
+
+            if attempt < attempts:
+                await asyncio.sleep(min(2 * attempt, 5))
+
+    raise ConnectionError(
+        f"User session stayed disconnected during {label} after {attempts} attempts"
+    ) from last_error
+
+
+async def resolve_user(user_id: int, peer):
+    """Resolve the requester through the user session, reconnecting on transport errors."""
+    try:
+        return await user_request(
+            f"resolve requester {user_id}",
+            lambda: user.get_input_entity(user_id),
+        )
+    except ValueError:
+        pass
+
+    try:
+        chat = await user_request(
+            f"resolve join-request chat for {user_id}",
+            lambda: user.get_input_entity(peer),
+        )
+        result = await user_request(
+            f"fetch pending requester {user_id}",
+            lambda: user(
+                functions.messages.GetChatInviteImportersRequest(
+                    peer=chat,
+                    offset_date=0,
+                    offset_user=types.InputUserEmpty(),
+                    limit=100,
+                    requested=True,
+                )
+            ),
+        )
+        for requester in result.users:
+            if requester.id == user_id:
+                return utils.get_input_user(requester)
+    except Exception as exc:
+        log.warning("Could not fetch pending requester %s: %s", user_id, exc)
+
+    return None
+
+
+async def send_intro_from_user_session(target):
+    """The STRING_SESSION account sends exactly one message: the intro."""
+    log.info("STEP 1/4 START: sending intro via user session")
+    try:
+        await user_request(
+            "send intro message",
+            lambda: user.send_message(
+                target, INTRO_MESSAGE, parse_mode="html", link_preview=False
+            ),
+        )
+        log.info("STEP 1/4 SUCCESS: intro sent via user session")
+    except Exception:
+        log.exception("STEP 1/4 FAILED: intro could not be sent via user session")
+        raise
 
 
 async def send_from_bot(method: str, payload: dict, label: str):
+    """Send a follow-up only through the bot. Never fall back to STRING_SESSION."""
     log.info("BOT API START: %s using %s", label, method)
-    result = await bot_api_request(method, payload)
-    log.info("BOT API SUCCESS: %s sent via bot", label)
-    return result
-
-
-async def deliver_opted_in_user(user_id: int, first_name: str) -> None:
-    if user_id in in_progress:
-        log.info("Delivery already running for user_id=%s", user_id)
-        return
-
-    in_progress.add(user_id)
     try:
-        async with delivery_semaphore:
-            ensure_opt_in_record(user_id)
-            row = get_request(user_id)
-            if not row:
-                raise RuntimeError("Could not load delivery queue record")
+        result = await bot_api_request(method, payload)
+        log.info("BOT API SUCCESS: %s sent via bot", label)
+        return result
+    except Exception:
+        log.exception("BOT API FAILED: %s using %s", label, method)
+        raise
 
-            stage = int(row["stage"])
-            if stage >= 4 or row["status"] == "delivered":
-                log.info("User %s has already received the full sequence", user_id)
-                return
 
-            log.info(
-                "OPT-IN DELIVERY START user_id=%s stage=%s source=%s",
-                user_id, stage, row["source"],
+def _telegram_entities_to_bot_api(entities):
+    """Convert supported Telethon caption entities to Bot API caption_entities."""
+    entity_types = {
+        "MessageEntityBold": "bold",
+        "MessageEntityItalic": "italic",
+        "MessageEntityUnderline": "underline",
+        "MessageEntityStrike": "strikethrough",
+        "MessageEntityCode": "code",
+        "MessageEntityPre": "pre",
+        "MessageEntityTextUrl": "text_link",
+        "MessageEntityUrl": "url",
+        "MessageEntityEmail": "email",
+        "MessageEntityPhone": "phone_number",
+        "MessageEntityMention": "mention",
+        "MessageEntityHashtag": "hashtag",
+        "MessageEntityCashtag": "cashtag",
+        "MessageEntityBotCommand": "bot_command",
+        "MessageEntityCustomEmoji": "custom_emoji",
+        "MessageEntitySpoiler": "spoiler",
+        "MessageEntityBlockquote": "blockquote",
+    }
+    converted = []
+    for entity in entities or []:
+        entity_type = entity_types.get(type(entity).__name__)
+        if not entity_type:
+            continue
+        item = {
+            "type": entity_type,
+            "offset": entity.offset,
+            "length": entity.length,
+        }
+        if entity_type == "text_link":
+            item["url"] = entity.url
+        elif entity_type == "custom_emoji":
+            item["custom_emoji_id"] = str(entity.document_id)
+        elif entity_type == "pre" and getattr(entity, "language", None):
+            item["language"] = entity.language
+        converted.append(item)
+    return converted
+
+
+def parse_telegram_post_url(post_url: str):
+    """Parse a public Telegram post URL into source chat and message ID."""
+    from urllib.parse import urlparse
+    parsed = urlparse(post_url)
+    parts = parsed.path.strip("/").split("/")
+    if parsed.netloc not in {"t.me", "www.t.me"} or len(parts) != 2 or not parts[1].isdigit():
+        raise ValueError(f"Unsupported Telegram post URL: {post_url}")
+    return f"@{parts[0]}", int(parts[1])
+
+
+async def get_source_caption(post_url: str):
+    """Read the source post caption and formatting with the user session."""
+    source_chat_name, source_message_id = parse_telegram_post_url(post_url)
+    source_chat = await user_request(
+        "resolve source media channel",
+        lambda: user.get_entity(source_chat_name),
+    )
+    source_message = await user_request(
+        "read source media post",
+        lambda: user.get_messages(source_chat, ids=source_message_id),
+    )
+    if source_message is None:
+        raise RuntimeError(f"Could not find source post: {post_url}")
+
+    caption = source_message.message or ""
+    caption_entities = _telegram_entities_to_bot_api(source_message.entities)
+    log.info("Source caption loaded from %s: %s characters", post_url, len(caption))
+    if not caption:
+        log.warning("Source post %s has no caption text to copy", post_url)
+    return caption, caption_entities
+
+
+async def get_first_name(user_id: int, target) -> str:
+    """Requester's first name (HTML-escaped). Falls back to a generic word."""
+    for ref in (target, user_id):
+        try:
+            entity = await user_request(
+                "fetch requester name",
+                lambda: user.get_entity(ref),
             )
+            name = (getattr(entity, "first_name", None) or "").strip()
+            if name:
+                return html.escape(name)
+        except Exception as exc:
+            log.warning("Could not fetch name via %r: %s", type(ref).__name__, exc)
+    return "DOST"
 
-            if stage < 1:
-                welcome_payload = {
-                    "chat_id": user_id,
-                    "text": WELCOME_TEXT.replace("{name}", first_name),
-                    "parse_mode": "HTML",
-                    "link_preview_options": {"is_disabled": True},
-                }
-                await send_from_bot("sendMessage", welcome_payload, "welcome text")
-                save_stage(user_id, 1)
-                stage = 1
 
-            if stage < 2:
-                video_chat, video_message_id = parse_telegram_post_url(VIDEO_POST_URL)
-                video_payload = {
-                    "chat_id": user_id,
-                    "from_chat_id": video_chat,
-                    "message_id": video_message_id,
-                }
-                # copyMessage keeps the original media caption and formatting.
-                await send_from_bot("copyMessage", video_payload, "setup video")
-                save_stage(user_id, 2)
-                stage = 2
+async def send_sequence(user_id: int, target):
+    log.info("MESSAGE SEQUENCE START for user_id=%s", user_id)
 
-            if stage < 3:
-                apk_chat, apk_message_id = parse_telegram_post_url(APK_POST_URL)
-                apk_payload = {
-                    "chat_id": user_id,
-                    "from_chat_id": apk_chat,
-                    "message_id": apk_message_id,
-                    "reply_markup": APK_BUTTONS,
-                }
-                # copyMessage keeps the APK post's original caption and formatting.
-                await send_from_bot("copyMessage", apk_payload, "APK message")
-                save_stage(user_id, 3)
-                stage = 3
+    bot_messages_sent = False
 
-            if stage < 4:
-                await send_from_bot(
-                    "sendMessage",
-                    {
-                        "chat_id": user_id,
-                        "text": INTRO_MESSAGE,
-                        "link_preview_options": {"is_disabled": True},
-                    },
-                    "intro message",
-                )
-                save_stage(user_id, 4)
+    # 1) Bot sends the welcome text first.
+    try:
+        first_name = await get_first_name(user_id, target)
+        welcome_payload = {
+            "chat_id": user_id,
+            "text": WELCOME_TEXT.replace("{name}", first_name),
+            "parse_mode": "HTML",
+            "link_preview_options": {"is_disabled": True},
+        }
+        await send_from_bot("sendMessage", welcome_payload, "welcome text")
 
-            log.info("DELIVERY COMPLETE user_id=%s", user_id)
+        # 2) Bot copies the setup video post, including its original caption.
+        video_chat, video_message_id = parse_telegram_post_url(VIDEO_POST_URL)
+        video_payload = {
+            "chat_id": user_id,
+            "from_chat_id": video_chat,
+            "message_id": video_message_id,
+        }
+        await send_from_bot("copyMessage", video_payload, "setup video")
 
-    except Exception as exc:
-        save_error(user_id, str(exc))
+        # 3) Bot copies the APK post. Read its caption explicitly and pass it to
+        # copyMessage so the caption and supported formatting are retained.
+        apk_chat, apk_message_id = parse_telegram_post_url(APK_POST_URL)
+        apk_caption, apk_caption_entities = await get_source_caption(APK_POST_URL)
+        apk_payload = {
+            "chat_id": user_id,
+            "from_chat_id": apk_chat,
+            "message_id": apk_message_id,
+            "reply_markup": APK_BUTTONS,
+        }
+        if apk_caption:
+            apk_payload["caption"] = apk_caption
+            if apk_caption_entities:
+                apk_payload["caption_entities"] = apk_caption_entities
+        await send_from_bot("copyMessage", apk_payload, "APK message")
+
+        bot_messages_sent = True
+        log.info("BOT MESSAGE SEQUENCE COMPLETE for user_id=%s", user_id)
+
+    except Exception:
+        # A bot cannot initiate a private chat until the user has opened it and
+        # pressed /start. Keep the requested order, but do not block the userbot
+        # intro when the Bot API rejects its private message.
         log.exception(
-            "OPT-IN DELIVERY FAILED user_id=%s; progress saved. User can send /retry.",
+            "BOT MESSAGE SEQUENCE FAILED for user_id=%s; continuing to userbot intro",
             user_id,
         )
-        raise
-    finally:
-        in_progress.discard(user_id)
+
+    # 4) User session sends the intro only after the bot stage was attempted.
+    await send_intro_from_user_session(target)
+
+    if bot_messages_sent:
+        log.info("FULL MESSAGE SEQUENCE COMPLETE for user_id=%s", user_id)
+    else:
+        log.warning(
+            "USERBOT INTRO SENT, BUT BOT MESSAGES WERE NOT DELIVERED for user_id=%s. "
+            "The requester may need to open the bot and press /start.",
+            user_id,
+        )
 
 
 @bot.on(events.Raw(types.UpdateBotChatInviteRequester))
 async def on_join_request(update):
-    """Persist join requests only; do not send unsolicited private messages."""
-    user_id = int(update.user_id)
-    peer = str(update.peer)
+    user_id = update.user_id
+
+    if user_id in already_messaged or user_id in in_progress:
+        return
+    in_progress.add(user_id)
+
+    log.info("Join request from %s in %s", user_id, update.peer)
 
     try:
-        save_join_request(user_id, peer)
-        row = get_request(user_id)
-        log.info(
-            "JOIN REQUEST QUEUED user_id=%s peer=%s requests=%s status=%s; waiting for /start",
-            user_id,
-            peer,
-            row["request_count"] if row else "?",
-            row["status"] if row else "?",
-        )
-    except Exception:
-        log.exception("Could not persist join request for user_id=%s", user_id)
-
-
-@bot.on(events.NewMessage(
-    incoming=True,
-    pattern=r"^/(start|retry)(?:@\w+)?(?:\s|$)",
-))
-async def on_start_or_retry(event):
-    if not event.is_private:
-        return
-
-    user_id = event.sender_id
-    if not user_id:
-        return
-
-    command = (event.raw_text or "").split(maxsplit=1)[0].split("@", 1)[0].lower()
-
-    try:
-        sender = await event.get_sender()
-        first_name = html.escape((getattr(sender, "first_name", None) or "").strip() or "DOST")
-    except Exception:
-        first_name = "DOST"
-
-    if command == "/retry":
-        existing = get_request(user_id)
-        if not existing:
-            await send_from_bot(
-                "sendMessage",
-                {
-                    "chat_id": user_id,
-                    "text": "No previous delivery was found. Send /start to begin.",
-                },
-                "retry help",
+        target = await resolve_user(user_id, update.peer)
+        if target is None:
+            log.warning(
+                "Cannot resolve user %s. Make sure the string-session account is an "
+                "admin of that chat and can see its pending join requests.",
+                user_id,
             )
             return
 
-    try:
-        await deliver_opted_in_user(user_id, first_name)
-        latest = get_request(user_id)
-        if latest and latest["status"] == "delivered":
-            await send_from_bot(
-                "sendMessage",
-                {
-                    "chat_id": user_id,
-                    "text": "✅ All messages have been delivered.",
-                },
-                "delivery confirmation",
-            )
-    except Exception:
-        # The request and last completed stage remain in SQLite.
-        # The user can send /retry after a temporary failure.
-        try:
-            await send_from_bot(
-                "sendMessage",
-                {
-                    "chat_id": user_id,
-                    "text": "Delivery was interrupted. Your progress is saved. Please send /retry.",
-                },
-                "retry notice",
-            )
-        except Exception:
-            log.exception("Could not send retry notice to user_id=%s", user_id)
+        await send_sequence(user_id, target)
+        already_messaged.add(user_id)
+        log.info("Full message sequence sent to %s", user_id)
+
+    except FloodWaitError as exc:
+        # Do not queue delayed sends; log Telegram's required wait and exit this sequence.
+        log.warning("FloodWait: Telegram requires a %ss wait; this sequence will stop without retrying.", exc.seconds)
+    except (UserPrivacyRestrictedError, UserIsBlockedError):
+        log.info("User %s does not accept private messages", user_id)
+    except PeerFloodError:
+        log.error("PeerFlood: the user account is limited for messaging new users. Stop sending and wait.")
+    except Exception as exc:
+        log.exception("Message sequence failed for %s: %s", user_id, exc)
+    finally:
+        in_progress.discard(user_id)
 
 
 async def main():
-    init_db()
-    await bot.start(bot_token=BOT_TOKEN)
+    await user.connect()
+    if not await user.is_user_authorized():
+        raise SystemExit("STRING_SESSION is invalid or revoked.")
 
+    await bot.start(bot_token=BOT_TOKEN)
+    await user.get_dialogs()
+
+    me_user = await user.get_me()
     me_bot = await bot.get_me()
     log.info(
-        "Running. Bot: @%s | durable queue: %s",
-        me_bot.username or "unknown",
-        DB_PATH,
+        "Running. Bot: @%s | Sender account: %s",
+        me_bot.username,
+        me_user.id,
     )
-    log.info(
-        "Join requests are queued. Users receive messages only after they open the bot and send /start."
-    )
-
     await bot.run_until_disconnected()
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        log.info("Bot stopped by operator.")
+    asyncio.run(main())
