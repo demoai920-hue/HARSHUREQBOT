@@ -96,6 +96,19 @@ in_progress: set[int] = set()
 class BotAPIError(RuntimeError):
     """Raised when Telegram's HTTP Bot API returns ok=false."""
 
+    def __init__(self, message: str, retry_after: int | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+# Bot API rate-limit handling (HTTP 429). Limit parallel sends and keep a small gap
+# between them so a burst of join requests (e.g. the backlog after a restart)
+# does not trip Telegram's flood control.
+BOT_SEND_SEMAPHORE = asyncio.Semaphore(3)
+BOT_SEND_GAP = 0.4          # seconds between bot sends
+BOT_MAX_RETRIES = 6         # retries on 429
+SEQUENCE_SEMAPHORE = asyncio.Semaphore(2)  # join-request sequences running at once
+
 
 def _bot_api_request(method: str, payload: dict):
     """Synchronous Bot API request, called through asyncio.to_thread()."""
@@ -118,7 +131,13 @@ def _bot_api_request(method: str, payload: dict):
         except json.JSONDecodeError:
             raise BotAPIError(f"HTTP {exc.code}: {body}") from exc
         if not result.get("ok"):
-            raise BotAPIError(result.get("description", f"HTTP {exc.code}")) from exc
+            retry_after = (result.get("parameters") or {}).get("retry_after")
+            if retry_after is None and exc.code == 429:
+                retry_after = 5
+            raise BotAPIError(
+                result.get("description", f"HTTP {exc.code}"),
+                retry_after=retry_after,
+            ) from exc
         return result.get("result")
     except (urllib.error.URLError, TimeoutError) as exc:
         raise BotAPIError(str(exc)) from exc
@@ -129,7 +148,22 @@ def _bot_api_request(method: str, payload: dict):
 
 
 async def bot_api_request(method: str, payload: dict):
-    return await asyncio.to_thread(_bot_api_request, method, payload)
+    """Bot API call with throttling and automatic retry when Telegram sends 429."""
+    for attempt in range(1, BOT_MAX_RETRIES + 1):
+        try:
+            async with BOT_SEND_SEMAPHORE:
+                result = await asyncio.to_thread(_bot_api_request, method, payload)
+                await asyncio.sleep(BOT_SEND_GAP)
+                return result
+        except BotAPIError as exc:
+            if exc.retry_after is None or attempt == BOT_MAX_RETRIES:
+                raise
+            wait = exc.retry_after + 1
+            log.warning(
+                "Bot API 429 on %s: waiting %ss before retry %s/%s",
+                method, wait, attempt, BOT_MAX_RETRIES,
+            )
+            await asyncio.sleep(wait)
 
 
 async def user_request(label: str, operation, attempts: int = 3):
@@ -400,18 +434,20 @@ async def on_join_request(update):
     log.info("Join request from %s in %s", user_id, update.peer)
 
     try:
-        target = await resolve_user(user_id, update.peer)
-        if target is None:
-            log.warning(
-                "Cannot resolve user %s. Make sure the string-session account is an "
-                "admin of that chat and can see its pending join requests.",
-                user_id,
-            )
-            return
+        async with SEQUENCE_SEMAPHORE:
+            target = await resolve_user(user_id, update.peer)
+            if target is None:
+                log.warning(
+                    "Cannot resolve user %s. Make sure the string-session account is an "
+                    "admin of that chat and can see its pending join requests.",
+                    user_id,
+                )
+                return
 
-        await send_sequence(user_id, target)
-        already_messaged.add(user_id)
-        log.info("Full message sequence sent to %s", user_id)
+            await send_sequence(user_id, target)
+            already_messaged.add(user_id)
+            log.info("Full message sequence sent to %s", user_id)
+            await asyncio.sleep(1)  # breathing room between users
 
     except FloodWaitError as exc:
         # Do not queue delayed sends; log Telegram's required wait and exit this sequence.
