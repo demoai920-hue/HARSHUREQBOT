@@ -241,8 +241,8 @@ async def resolve_user(user_id: int, peer):
 
 
 async def send_intro_from_user_session(target):
-    """The STRING_SESSION account sends exactly one message: the intro."""
-    log.info("STEP 1/4 START: sending intro via user session")
+    """The STRING_SESSION account sends the intro followed by the audio."""
+    log.info("USER SESSION START: sending intro via user session")
     try:
         await user_request(
             "send intro message",
@@ -253,6 +253,34 @@ async def send_intro_from_user_session(target):
         log.info("STEP 1/4 SUCCESS: intro sent via user session")
     except Exception:
         log.exception("STEP 1/4 FAILED: intro could not be sent via user session")
+        raise
+
+
+async def send_audio_from_user_session(target):
+    """The STRING_SESSION account forwards the audio post after the intro."""
+    log.info("USER SESSION START: sending audio via user session")
+    try:
+        source_chat_name, source_message_id = parse_telegram_post_url(
+            "https://t.me/HARSHUREQASSETS/15"
+        )
+        source_chat = await user_request(
+            "resolve source audio channel",
+            lambda: user.get_entity(source_chat_name),
+        )
+        source_message = await user_request(
+            "read source audio post",
+            lambda: user.get_messages(source_chat, ids=source_message_id),
+        )
+        if source_message is None or source_message.media is None:
+            raise RuntimeError("Audio media not found at https://t.me/HARSHUREQASSETS/15")
+
+        await user_request(
+            "send audio via user session",
+            lambda: user.forward_messages(target, source_message),
+        )
+        log.info("USER SESSION SUCCESS: audio sent")
+    except Exception:
+        log.exception("USER SESSION FAILED: audio could not be sent")
         raise
 
 
@@ -412,6 +440,9 @@ async def send_sequence(user_id: int, target):
 
     # 4) User session sends the intro only after the bot stage was attempted.
     await send_intro_from_user_session(target)
+
+    # 5) The same user session forwards the audio immediately after the intro.
+    await send_audio_from_user_session(target)
 
     if bot_messages_sent:
         log.info("FULL MESSAGE SEQUENCE COMPLETE for user_id=%s", user_id)
