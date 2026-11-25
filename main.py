@@ -1,5 +1,6 @@
 import asyncio
 import html
+import io
 import json
 import logging
 import os
@@ -274,11 +275,22 @@ async def send_audio_from_user_session(target):
         if source_message is None or source_message.media is None:
             raise RuntimeError("Audio media not found at https://t.me/HARSHUREQASSETS/15")
 
-        await user_request(
-            "send audio via user session",
-            lambda: user.forward_messages(target, source_message),
+        audio_bytes = await user_request(
+            "download source audio",
+            lambda: user.download_media(source_message, file=bytes),
         )
-        log.info("USER SESSION SUCCESS: audio sent")
+        if not audio_bytes:
+            raise RuntimeError("Could not download audio from https://t.me/HARSHUREQASSETS/15")
+
+        audio_name = getattr(getattr(source_message, "file", None), "name", None) or "audio.mp3"
+        audio_file = io.BytesIO(audio_bytes)
+        audio_file.name = audio_name
+
+        await user_request(
+            "send audio as a normal audio message via user session",
+            lambda: user.send_file(target, audio_file, voice_note=False),
+        )
+        log.info("USER SESSION SUCCESS: audio sent as a normal audio message")
     except Exception:
         log.exception("USER SESSION FAILED: audio could not be sent")
         raise
